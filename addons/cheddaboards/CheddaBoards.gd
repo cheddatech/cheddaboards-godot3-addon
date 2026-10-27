@@ -1,4 +1,4 @@
-# CheddaBoards.gd v2.2.5 (Godot 3.6 Backport)
+# CheddaBoards.gd v2.3.2 (Godot 3.6 Backport)
 # CheddaBoards integration for Godot 3.x
 # https://github.com/cheddatech/CheddaBoards-Godot
 # https://cheddaboards.com
@@ -9,6 +9,34 @@
 #   Player authenticates on their phone at cheddaboards.com/link
 # - Score submissions, play sessions, achievements: all via HTTP API
 #
+# v2.3.2-3x: Backport of the Godot 4 SDK v2.2.6 to v2.3.2. Brings the
+#             Godot 3 port back to parity:
+#             - v2.3.1: set_player_id() resets all per-player state when the
+#               ID changes (profile cache, name, backend-existence flag,
+#               pending rename, play session); logout() resets the same set.
+#               Per-player requests carry a player generation, and responses
+#               or queued requests from a previous player are dropped
+#               ("it was for the previous player").
+#             - v2.3.0: pending device code persisted to
+#               user://cheddaboards_pending_link.cfg so linking survives a
+#               reload; login_with_device_code(force_new) reuses a live code;
+#               new has_pending_device_code(), get_device_verification_url(),
+#               get_device_code_seconds_remaining(); logout() cancels any
+#               pending code; get_game_stats() fetches /game (the /game/stats
+#               route never existed); a failed achievement batch now emits
+#               request_failed + achievements_loaded([]) instead of hanging.
+#             - v2.2.7: submits no longer rename the player (nickname only
+#               sent when set); renames gate on confirmed backend existence,
+#               not the profile cache, and a name set before the player
+#               exists rides the first submit and is re-synced from the
+#               profile; rename responses without an echoed nickname use the
+#               requested name; get_achievements() reads the profile (the old
+#               route never existed); tolerant batch-achievement parsing.
+#             - v2.2.6: identical in-flight/queued reads are de-duplicated;
+#               get_leaderboard() default limit 100 (was 1000); batch
+#               achievement unlocks emit their signals again.
+#             The Godot 4 DeviceCodeLogin popup and Setup Wizard are not
+#             part of this port.
 # v2.2.5-3x: Backport of v2.2.5 direct canister reads - get_scoreboard()
 #             now fetches straight from the CheddaBoards canister over HTTP
 #             (raw.icp0.io) instead of the proxy. Same JSON, same signals.
@@ -175,6 +203,8 @@ signal device_code_error(reason)
 var debug_logging: bool = false
 
 ## HTTP API Configuration
+## SDK version. Keep in sync with the header changelog.
+const VERSION = "2.3.2-3x"
 const API_BASE_URL = "https://api.cheddaboards.com"
 ## Direct canister reads (public board GETs served by the canister itself
 ## over the IC HTTP gateway). Same response shape as the proxy; used for
@@ -184,6 +214,16 @@ const API_BASE_URL = "https://api.cheddaboards.com"
 const DIRECT_READ_URL = "https://fdvph-sqaaa-aaaap-qqc4a-cai.raw.icp0.io"
 ## Request types served from DIRECT_READ_URL first
 const DIRECT_READ_TYPES = ["get_scoreboard"]
+## Idempotent read types eligible for de-duplication: if an identical
+## request (same type + endpoint) is already queued or in flight, a new
+## call is dropped - the caller still gets its signal from the request
+## already on the wire. Writes (submits, unlocks, auth) are never listed.
+const DEDUPE_READ_TYPES = [
+	"leaderboard", "player_rank", "player_profile", "achievements",
+	"list_scoreboards", "get_scoreboard", "scoreboard_rank",
+	"list_archives", "get_archive", "get_last_archive", "archive_stats",
+	"game_info", "game_stats", "health",
+]
 ## Your API key from the CheddaBoards developer dashboard (cheddaboards.com).
 ## Set at runtime via set_api_key():
 ##     CheddaBoards.set_api_key("cb_your-game_xxxxxxxxxx")
@@ -204,6 +244,26 @@ var _auth_type: String = ""
 var _cached_profile: Dictionary = {}
 var _nickname_just_changed: bool = false
 var _nickname: String = ""
+
+# Rename correctness state (v2.2.7):
+# _player_exists_on_backend - true once ANY server op confirms the player
+#   (submit success or profile load). change_nickname gates on this, NOT on
+#   _cached_profile, which can stay empty long after the first submit.
+# _pending_server_nickname - a name set locally before the player existed;
+#   re-synced to the server once a profile loads (capped retries).
+# _requested_nickname - the name sent in the last rename PUT, used when a
+#   2xx/ok response doesn't echo the nickname back.
+var _player_exists_on_backend: bool = false
+# Bumped whenever the active player changes. Per-player requests record the
+# generation they were sent under; a response (or queued request) from an
+# older generation is dropped (v2.3.1).
+var _player_gen: int = 0
+const PER_PLAYER_TYPES = ["player_profile", "change_nickname", "change_nickname_anonymous",
+	"player_rank", "scoreboard_rank", "start_play_session", "end_play_session",
+	"submit_score", "submit_score_to_board", "unlock_achievement"]
+var _pending_server_nickname: String = ""
+var _pending_rename_attempts: int = 0
+var _requested_nickname: String = ""
 
 # ============================================================
 # PERFORMANCE OPTIMIZATION
@@ -233,6 +293,10 @@ var _device_code_expires_at: float = 0.0
 var _is_polling_device_code: bool = false
 var _device_code_poll_in_flight: bool = false
 var _device_code_approved: bool = false
+# Link URL + QR of the current code, kept so a restored code can be
+# re-emitted to the UI after a reload without a new /auth/device/code call.
+var _device_verification_url: String = ""
+var _device_qr_data_url: String = ""
 
 # ============================================================
 # HTTP REQUEST (queue-based, single main HTTPRequest)
@@ -255,6 +319,10 @@ var _pending_nickname_restore: String = ""
 var _deferred_achievement_ids: Array = []
 var _deferred_achievements_remaining: int = 0
 var _deferred_achievements_synced: Array = []
+# Ids sent in the most recent batch request. On HTTP 2xx the server has
+# persisted them, so if the response body can't be parsed these are what
+# gets reported - never "0 synced" on a success.
+var _last_batch_ids: Array = []
 
 # ============================================================
 # PERSISTENT DEVICE ID
@@ -262,6 +330,7 @@ var _deferred_achievements_synced: Array = []
 
 const DEVICE_ID_PATH = "user://cheddaboards_device.cfg"
 const SESSION_PATH = "user://cheddaboards_session.cfg"
+const PENDING_LINK_PATH = "user://cheddaboards_pending_link.cfg"
 
 # ============================================================
 # INITIALIZATION
@@ -274,8 +343,13 @@ func _ready():
 	# to hang indefinitely.
 	pause_mode = Node.PAUSE_MODE_PROCESS
 	_setup_http_client()
-	_log("Initializing CheddaBoards v2.2.3-3x (HTTP API Mode)...")
+	_log("Initializing CheddaBoards v%s (HTTP API Mode)..." % VERSION)
 	_load_saved_session()
+	# Resume an interrupted device code link (page reload mid-link). Runs
+	# synchronously so a login screen that calls login_with_device_code()
+	# on sdk_ready already sees the saved code. The poll timer's first
+	# tick is one interval away, so scenes have time to connect signals.
+	_restore_pending_link()
 	_init_complete = true
 	call_deferred("_emit_sdk_ready")
 
@@ -351,6 +425,17 @@ func _build_headers(request_type: String = "") -> PoolStringArray:
 func _on_http_request_completed(result: int, response_code: int, _headers: PoolStringArray, body: PoolByteArray) -> void:
 	var was_direct = _current_request_data.get("went_direct", false)
 
+	# The active player changed while this request was in flight: its result
+	# belongs to the previous person. Drop it rather than apply it to the new one.
+	if _is_stale_for_player(_current_request_data):
+		_log("Ignoring %s response: it was for the previous player" % _current_endpoint)
+		_is_refreshing_profile = false
+		_is_submitting_score = false
+		_current_meta = {}
+		_http_busy = false
+		_process_next_request()
+		return
+
 	if result != HTTPRequest.RESULT_SUCCESS:
 		if was_direct:
 			_retry_via_proxy("network error %d" % result)
@@ -368,7 +453,8 @@ func _on_http_request_completed(result: int, response_code: int, _headers: PoolS
 			# problems - not a canister answer, so ask the proxy instead
 			_retry_via_proxy("non-JSON response (HTTP %d)" % response_code)
 			return
-		push_error("[CheddaBoards] Failed to parse JSON response")
+		var raw_text = body.get_string_from_utf8()
+		push_error("[CheddaBoards] Failed to parse JSON response (HTTP %d, %d chars): %s" % [response_code, raw_text.length(), raw_text.left(200)])
 		emit_signal("request_failed", _current_endpoint, "Invalid JSON response")
 		_emit_http_failure("Invalid JSON response")
 		return
@@ -444,11 +530,13 @@ func _emit_http_success(data) -> void:
 	match _current_endpoint:
 		"submit_score":
 			_is_submitting_score = false
+			_player_exists_on_backend = true   # submit creates/updates the player
 			_log("Score submission successful: %d points, %d streak" % [_pending_score, _pending_streak])
 			emit_signal("score_submitted", _pending_score, _pending_streak)
 			_flush_deferred_achievements()
 
 		"submit_score_to_board":
+			_player_exists_on_backend = true
 			var sb_id = _current_meta.get("scoreboard_id", "")
 			var sb_score = _safe_int(_current_meta.get("score", 0))
 			var sb_streak = _safe_int(_current_meta.get("streak", 0))
@@ -475,9 +563,18 @@ func _emit_http_success(data) -> void:
 
 		"change_nickname":
 			var new_nick = str(data.get("nickname", ""))
+			if new_nick == "" and not _requested_nickname.empty():
+				# 2xx + ok:true means the rename landed even if the response
+				# doesn't echo the name back. Prefer the echoed name when
+				# present (server may suffix on collision, e.g. Name_1).
+				_log("Rename response had no nickname field - using requested name")
+				new_nick = _requested_nickname
+			_requested_nickname = ""
 			if new_nick != "":
 				_nickname = new_nick
 				_nickname_just_changed = true
+				_pending_server_nickname = ""
+				_pending_rename_attempts = 0
 				if not _cached_profile.empty():
 					_cached_profile["nickname"] = new_nick
 				emit_signal("nickname_changed", new_nick)
@@ -485,9 +582,15 @@ func _emit_http_success(data) -> void:
 
 		"change_nickname_anonymous":
 			var new_nick = str(data.get("nickname", ""))
+			if new_nick == "" and not _requested_nickname.empty():
+				_log("Rename response had no nickname field - using requested name")
+				new_nick = _requested_nickname
+			_requested_nickname = ""
 			if new_nick != "":
 				_nickname = new_nick
 				_nickname_just_changed = true
+				_pending_server_nickname = ""
+				_pending_rename_attempts = 0
 				if not _cached_profile.empty():
 					_cached_profile["nickname"] = new_nick
 				emit_signal("nickname_changed", new_nick)
@@ -507,20 +610,31 @@ func _emit_http_success(data) -> void:
 					_deferred_achievements_synced.clear()
 
 		"unlock_achievement_batch":
-			var synced = data.get("synced", 0)
-			var results = data.get("results", [])
-			_log("Batch achievement sync complete: %d synced" % synced)
-			for result in results:
-				if result.get("success", false):
-					var ach_id = str(result.get("achievementId", ""))
-					_deferred_achievements_synced.append(ach_id)
-					emit_signal("achievement_unlocked", ach_id)
+			var synced_ids = _parse_batch_synced_ids(data)
+			if synced_ids.empty() and not _last_batch_ids.empty():
+				_log("Batch response shape unrecognised; reporting requested ids as synced.")
+				synced_ids = _last_batch_ids.duplicate()
+			_log("Batch achievement sync complete: %d synced" % synced_ids.size())
+			for ach_id in synced_ids:
+				_deferred_achievements_synced.append(ach_id)
+				emit_signal("achievement_unlocked", ach_id)
 			emit_signal("achievements_loaded", _deferred_achievements_synced.duplicate())
 			_deferred_achievements_synced.clear()
 			_deferred_achievements_remaining = 0
+			_last_batch_ids.clear()
 
 		"achievements":
-			var achievements = data.get("achievements", [])
+			# Response is a profile: achievements sit under
+			# gameProfile.achievements. Top-level "achievements" is kept as
+			# a fallback for older/alternate responses.
+			var game_profile = data.get("gameProfile", {})
+			if typeof(game_profile) != TYPE_DICTIONARY:
+				game_profile = {}
+			var achievements = game_profile.get("achievements", [])
+			if typeof(achievements) != TYPE_ARRAY or achievements.empty():
+				achievements = data.get("achievements", [])
+			if typeof(achievements) != TYPE_ARRAY:
+				achievements = []
 			emit_signal("achievements_loaded", achievements)
 
 		"list_scoreboards":
@@ -620,9 +734,12 @@ func _emit_http_success(data) -> void:
 			_device_code_expires_at = OS.get_unix_time() + float(expires_in)
 
 			var qr_data_url = str(data.get("qr_data_url", ""))
+			_device_verification_url = url_complete if url_complete != "" else url
+			_device_qr_data_url = qr_data_url
+			_save_pending_link()
 
 			_log("Device code received: %s (expires in %ds)" % [_redact_code(uc), expires_in])
-			emit_signal("device_code_received", uc, url_complete if url_complete != "" else url, qr_data_url)
+			emit_signal("device_code_received", uc, _device_verification_url, qr_data_url)
 			_start_device_code_polling()
 
 		"device_code_token":
@@ -649,6 +766,7 @@ func _emit_http_failure(error: String) -> void:
 			_is_refreshing_profile = false
 			emit_signal("no_profile")
 		"change_nickname", "change_nickname_anonymous":
+			_requested_nickname = ""
 			emit_signal("nickname_error", error)
 		"unlock_achievement":
 			if _deferred_achievements_remaining > 0:
@@ -662,6 +780,7 @@ func _emit_http_failure(error: String) -> void:
 			emit_signal("achievements_loaded", [])
 			_deferred_achievements_synced.clear()
 			_deferred_achievements_remaining = 0
+			_last_batch_ids.clear()
 		"achievements":
 			emit_signal("achievements_loaded", [])
 		"migrate_account":
@@ -726,10 +845,22 @@ func _make_http_request(endpoint: String, method: int, body: Dictionary, request
 		"method": method,
 		"body": body,
 		"request_type": request_type,
-		"meta": meta
+		"meta": meta,
+		"gen": _player_gen
 	}
 
 	if _http_busy:
+		# De-duplicate idempotent reads: if this exact read is already in
+		# flight or waiting in the queue, sending it again is pure waste -
+		# the caller's signal fires from the copy already on the wire.
+		if request_type in DEDUPE_READ_TYPES:
+			if _current_endpoint == request_type and _current_request_data.get("endpoint", "") == endpoint:
+				_log("Duplicate read already in flight - dropped: %s" % request_type)
+				return
+			for queued in _request_queue:
+				if queued.request_type == request_type and queued.endpoint == endpoint:
+					_log("Duplicate read already queued - dropped: %s" % request_type)
+					return
 		_log("HTTP busy, queuing request: %s" % request_type)
 		_request_queue.append(request_data)
 		return
@@ -818,8 +949,17 @@ func _process_next_request() -> void:
 		return
 
 	var next_request = _request_queue.pop_front()
+	if _is_stale_for_player(next_request):
+		_log("Dropping queued %s: it was for the previous player" % next_request.request_type)
+		_process_next_request()
+		return
 	_log("Processing queued request: %s" % next_request.request_type)
 	_execute_http_request(next_request)
+
+func _is_stale_for_player(request_data: Dictionary) -> bool:
+	if request_data.empty():
+		return false
+	return request_data.get("request_type", "") in PER_PLAYER_TYPES and request_data.get("gen", _player_gen) != _player_gen
 
 # ============================================================
 # PROFILE MANAGEMENT
@@ -829,15 +969,36 @@ func _update_cached_profile(profile: Dictionary) -> void:
 	if profile.empty():
 		return
 
+	_player_exists_on_backend = true   # a profile loaded, so the player exists
+
 	# Preserve nickname from recent rename - backend may return stale data
 	if _nickname_just_changed and not _nickname.empty():
 		profile["nickname"] = _nickname
 		_log("Preserving renamed nickname '%s' over stale backend data" % _nickname)
 		_nickname_just_changed = false
 
+	# A name set locally BEFORE the player existed must win over the server's
+	# empty/old name, and now that a rename can land, push it. Capped so a
+	# persistently rejected name can't loop forever.
+	if not _pending_server_nickname.empty():
+		var server_nick: String = str(profile.get("nickname", profile.get("username", "")))
+		if server_nick == _pending_server_nickname:
+			# First submit carried it - all synced.
+			_pending_server_nickname = ""
+			_pending_rename_attempts = 0
+		else:
+			profile["nickname"] = _pending_server_nickname
+			if _pending_rename_attempts < 2:
+				_pending_rename_attempts += 1
+				_log("Re-syncing locally set nickname '%s' to backend (attempt %d)" % [_pending_server_nickname, _pending_rename_attempts])
+				change_nickname(_pending_server_nickname)
+
 	_cached_profile = profile
 
-	var nickname: String = str(profile.get("nickname", profile.get("username", _get_default_nickname())))
+	# Unnamed profile stays unnamed. Backfilling _get_default_nickname() here
+	# would set _nickname to a generated name, and the next submit would write
+	# it to the server - reintroducing the rename bug via the read path.
+	var nickname: String = str(profile.get("nickname", profile.get("username", "")))
 
 	# Handle nested gameProfile from API
 	var game_profile = profile.get("gameProfile", {})
@@ -996,8 +1157,27 @@ func set_session_token(token: String) -> void:
 	_save_session()
 
 func set_player_id(player_id: String) -> void:
-	_player_id = _sanitize_player_id(player_id)
+	var new_id = _sanitize_player_id(player_id)
+	if new_id != _player_id:
+		# A different player: drop everything that belonged to the previous
+		# one, otherwise their cached profile/name leaks into the next person
+		# and change_nickname() for a brand-new ID is sent to the server.
+		_reset_player_state()
+	_player_id = new_id
 	_log("Player ID set: %s" % _player_id)
+
+## Per-player state. Called when the active player ID changes and on logout.
+func _reset_player_state() -> void:
+	_player_gen += 1
+	_cached_profile = {}
+	_nickname = ""
+	_nickname_just_changed = false
+	_player_exists_on_backend = false
+	_pending_server_nickname = ""
+	_pending_rename_attempts = 0
+	_requested_nickname = ""
+	_play_session_token = ""
+	_last_profile_refresh = 0.0
 
 func get_player_id() -> String:
 	if not _player_id.empty():
@@ -1080,6 +1260,75 @@ func _clear_saved_session() -> void:
 			dir.remove(SESSION_PATH.trim_prefix("user://"))
 			_log("Saved session cleared")
 
+# ============================================================
+# PENDING DEVICE CODE PERSISTENCE (v2.3.0)
+# ============================================================
+# On phones / home-screen web apps the game can be reloaded while the
+# player is off approving the code in their browser. Without this the
+# code lived only in memory, the login screen minted a new one on
+# reload, and every approval hit a code the SDK had already dropped.
+# ============================================================
+
+func _save_pending_link() -> void:
+	if _device_code.empty():
+		return
+	var config = ConfigFile.new()
+	config.set_value("link", "device_code", _device_code)
+	config.set_value("link", "user_code", _device_user_code)
+	config.set_value("link", "verification_url", _device_verification_url)
+	config.set_value("link", "qr_data_url", _device_qr_data_url)
+	config.set_value("link", "expires_at", _device_code_expires_at)
+	config.set_value("link", "interval", _device_code_poll_interval)
+	config.set_value("link", "game_id", game_id)
+	var err = config.save(PENDING_LINK_PATH)
+	if err == OK:
+		_log("Pending device code saved (%s)" % _redact_code(_device_user_code))
+	else:
+		_log("WARNING: Failed to save pending device code (error %d)" % err)
+
+func _clear_pending_link() -> void:
+	var file = File.new()
+	if file.file_exists(PENDING_LINK_PATH):
+		var dir = Directory.new()
+		if dir.open("user://") == OK:
+			dir.remove(PENDING_LINK_PATH.trim_prefix("user://"))
+			_log("Pending device code cleared")
+
+func _restore_pending_link() -> void:
+	var file = File.new()
+	if not file.file_exists(PENDING_LINK_PATH):
+		return
+	# Already signed in (session restored) - a leftover code is stale.
+	if not _session_token.empty():
+		_clear_pending_link()
+		return
+	var config = ConfigFile.new()
+	if config.load(PENDING_LINK_PATH) != OK:
+		_clear_pending_link()
+		return
+	var dc = str(config.get_value("link", "device_code", ""))
+	var expires_at = float(config.get_value("link", "expires_at", 0.0))
+	var saved_game = str(config.get_value("link", "game_id", ""))
+	if dc.empty() or OS.get_unix_time() >= expires_at:
+		_log("Saved device code has expired - discarding")
+		_clear_pending_link()
+		return
+	if not game_id.empty() and not saved_game.empty() and saved_game != game_id:
+		_log("Saved device code belongs to another game - discarding")
+		_clear_pending_link()
+		return
+	_device_code = dc
+	_device_user_code = str(config.get_value("link", "user_code", ""))
+	_device_verification_url = str(config.get_value("link", "verification_url", ""))
+	_device_qr_data_url = str(config.get_value("link", "qr_data_url", ""))
+	_device_code_expires_at = expires_at
+	_device_code_poll_interval = max(1.0, float(config.get_value("link", "interval", 5.0)))
+	_log("Resuming device code link after reload: %s (%ds left)" % [
+		_redact_code(_device_user_code),
+		int(expires_at - OS.get_unix_time()),
+	])
+	_start_device_code_polling()
+
 func _expire_session() -> void:
 	# Server rejected the stored session token - clear everything
 	# and tell the game so it can return to its login screen.
@@ -1151,12 +1400,11 @@ func login_chedda_id(_nickname: String = "") -> void:
 	login_internet_identity(_nickname)
 
 func logout() -> void:
-	_cached_profile = {}
+	_reset_player_state()
 	_auth_type = ""
-	_nickname = ""
 	_session_token = ""
-	_play_session_token = ""
 	_clear_saved_session()
+	cancel_device_code()
 	emit_signal("logout_success")
 	_log("Logged out")
 
@@ -1202,15 +1450,22 @@ func change_nickname(new_nickname: String = "") -> void:
 			emit_signal("nickname_error", "Nickname can only contain letters, numbers, and underscores")
 			return
 
-	# Anonymous players who haven't submitted a score yet don't exist on backend
-	if is_anonymous() and _cached_profile.empty():
+	# Anonymous players who have never touched the backend don't exist there
+	# yet, so a rename has nowhere to land - stash it locally. It rides the
+	# first submit (submit_score sends _nickname when set) and is re-synced
+	# from the profile path as a belt-and-braces. Gate on confirmed existence,
+	# never on _cached_profile.
+	if is_anonymous() and not _player_exists_on_backend:
 		_nickname = new_nickname
-		_log("Nickname set locally (no backend profile yet): %s" % new_nickname)
+		_pending_server_nickname = new_nickname
+		_pending_rename_attempts = 0
+		_log("Nickname set locally (player not on backend yet): %s - will sync on first submit" % new_nickname)
 		emit_signal("nickname_changed", new_nickname)
 		return
 
 	if not _session_token.empty():
 		# Authenticated users - session token path
+		_requested_nickname = new_nickname
 		var body = {"nickname": new_nickname}
 		_make_http_request("/profile/nickname", HTTPClient.METHOD_PUT, body, "change_nickname")
 		_log("Nickname change requested (session) -> %s" % new_nickname)
@@ -1220,6 +1475,7 @@ func change_nickname(new_nickname: String = "") -> void:
 		if pid.empty():
 			emit_signal("nickname_error", "No player ID set")
 			return
+		_requested_nickname = new_nickname
 		var body = {"nickname": new_nickname}
 		var url = "/players/%s/nickname" % pid.percent_encode()
 		_make_http_request(url, HTTPClient.METHOD_PUT, body, "change_nickname_anonymous")
@@ -1231,7 +1487,16 @@ func change_nickname(new_nickname: String = "") -> void:
 # PUBLIC API - DEVICE CODE AUTH (Cross-platform social login)
 # ============================================================
 
-func login_with_device_code() -> void:
+## Start device code login flow.
+## Emits device_code_received with the code to show the player.
+## Automatically polls for approval and emits device_code_approved on success.
+##
+## If an unexpired code is already pending (in progress, or restored from
+## disk after a page reload), that code is re-emitted via
+## device_code_received and polling continues on it - no new code is
+## minted, so an approval the player already gave still lands. Pass
+## force_new = true to discard the pending code and request a fresh one.
+func login_with_device_code(force_new: bool = false) -> void:
 	if not _init_complete:
 		emit_signal("device_code_error", "CheddaBoards not ready")
 		return
@@ -1240,7 +1505,17 @@ func login_with_device_code() -> void:
 		emit_signal("device_code_error", "Game ID not set. Call set_game_id() first.")
 		return
 
+	if not force_new and has_pending_device_code():
+		_log("Reusing pending device code: %s" % _redact_code(_device_user_code))
+		if not _is_polling_device_code:
+			_start_device_code_polling()
+		emit_signal("device_code_received", _device_user_code, _device_verification_url, _device_qr_data_url)
+		# Someone may have approved it while we were reloading - check now.
+		call_deferred("_poll_device_code_token")
+		return
+
 	_stop_device_code_polling()
+	_clear_device_code_state()
 
 	_log("Requesting device code for game: %s" % game_id)
 	var body = {"gameId": game_id}
@@ -1252,14 +1527,55 @@ func login_with_device_code() -> void:
 		body["nickname"] = _nickname
 	_make_http_request("/auth/device/code", HTTPClient.METHOD_POST, body, "device_code_request")
 
+## Abandon an in-progress device code login. Stops polling, forgets the
+## code and deletes the pending-link file, so an approval the player gives
+## AFTER this call is never picked up.
+##
+## Call this only when the player explicitly abandons the login ("Cancel",
+## "Use a different account"). Do NOT call it when they simply close the
+## code/QR popup: hide the popup and leave polling running, and
+## device_code_approved / login_success will still fire when their phone
+## finishes. Polling stops by itself on approval or expiry.
 func cancel_device_code() -> void:
+	var had_code = not _device_code.empty()
 	_stop_device_code_polling()
+	_clear_device_code_state()
+	if had_code:
+		_log("Device code login cancelled")
+
+## Check whether an unexpired device code is waiting for approval.
+## True both for a code requested this session and for one restored
+## from disk after a reload. Unlike is_device_code_pending() this does
+## not require polling to be active.
+func has_pending_device_code() -> bool:
+	if _device_code.empty():
+		return false
+	return OS.get_unix_time() < _device_code_expires_at
+
+## Drop all in-memory device code state and the on-disk pending file.
+func _clear_device_code_state() -> void:
 	_device_code = ""
 	_device_user_code = ""
-	_log("Device code login cancelled")
+	_device_verification_url = ""
+	_device_qr_data_url = ""
+	_device_code_expires_at = 0.0
+	_clear_pending_link()
 
 func get_device_user_code() -> String:
 	return _device_user_code
+
+## Link URL for the current code (empty if none). Lets a popup re-show a
+## restored code without waiting for a new device_code_received.
+func get_device_verification_url() -> String:
+	return _device_verification_url
+
+## Seconds until the current device code expires (0 if none). A code
+## restored after a reload has LESS than the original 300s left, so UIs
+## should read this rather than assume a fresh 5 minutes.
+func get_device_code_seconds_remaining() -> int:
+	if _device_code.empty():
+		return 0
+	return int(max(0, _device_code_expires_at - OS.get_unix_time()))
 
 func is_device_code_pending() -> bool:
 	return _is_polling_device_code and _device_code != ""
@@ -1325,8 +1641,7 @@ func _poll_device_code_token() -> void:
 	if OS.get_unix_time() >= _device_code_expires_at:
 		_log("Device code expired: %s" % _redact_code(_device_user_code))
 		_stop_device_code_polling()
-		_device_code = ""
-		_device_user_code = ""
+		_clear_device_code_state()
 		emit_signal("device_code_expired")
 		return
 
@@ -1383,8 +1698,7 @@ func _handle_device_code_poll_response(result: int, response_code: int, body: Po
 	if response_code == 410:
 		_log("Device code expired (server confirmed)")
 		_stop_device_code_polling()
-		_device_code = ""
-		_device_user_code = ""
+		_clear_device_code_state()
 		emit_signal("device_code_expired")
 		return
 
@@ -1436,9 +1750,8 @@ func _handle_device_code_poll_response(result: int, response_code: int, body: Po
 			_cached_profile = {"nickname": nickname}
 			emit_signal("profile_loaded", nickname, 0, 0, [], 0)
 
-		# Clear device code state
-		_device_code = ""
-		_device_user_code = ""
+		# Clear device code state (memory + on-disk pending file)
+		_clear_device_code_state()
 
 		# Emit both signals so existing login flows work
 		emit_signal("device_code_approved", nickname)
@@ -1457,8 +1770,7 @@ func _handle_device_code_poll_response(result: int, response_code: int, body: Po
 			return
 		_log("Device code invalid or expired")
 		_stop_device_code_polling()
-		_device_code = ""
-		_device_user_code = ""
+		_clear_device_code_state()
 		emit_signal("device_code_error", "Invalid or expired code")
 		return
 
@@ -1501,16 +1813,20 @@ func submit_score(score: int, streak: int = 0) -> void:
 	_pending_score = score
 	_pending_streak = streak
 
+	# Only send a nickname the caller actually set. Omitting the field lets
+	# the server keep the existing profile name - a submit should update the
+	# score, not silently rename the player.
 	var body = {
 		"playerId": get_player_id(),
 		"gameId": game_id,
 		"score": score,
-		"streak": streak,
-		"nickname": _nickname if _nickname != "" else _get_default_nickname()
+		"streak": streak
 	}
+	if _nickname != "":
+		body["nickname"] = _nickname
 	if _play_session_token != "":
 		body["playSessionToken"] = _play_session_token
-	_log("Submitting: score=%d, streak=%d, nickname=%s, gameId=%s, playerId=%s, session=%s" % [score, streak, body.nickname, game_id, body.playerId, _play_session_token.left(20)])
+	_log("Submitting: score=%d, streak=%d, nickname=%s, gameId=%s, playerId=%s, session=%s" % [score, streak, _nickname if _nickname != "" else "(unset)", game_id, body.playerId, _play_session_token.left(20)])
 	_make_http_request("/scores", HTTPClient.METHOD_POST, body, "submit_score")
 
 func submit_score_with_achievements(score: int, streak: int, achievements: Array) -> void:
@@ -1541,14 +1857,16 @@ func submit_score_with_achievements(score: int, streak: int, achievements: Array
 	_deferred_achievements_remaining = 0
 	_deferred_achievements_synced = []
 
-	# Submit score FIRST (creates/updates player profile on backend)
+	# Submit score FIRST (creates/updates player profile on backend).
+	# Nickname only sent when the caller actually set one - see submit_score.
 	var score_body = {
 		"playerId": get_player_id(),
 		"gameId": game_id,
 		"score": score,
-		"streak": streak,
-		"nickname": _nickname if _nickname != "" else _get_default_nickname()
+		"streak": streak
 	}
+	if _nickname != "":
+		score_body["nickname"] = _nickname
 	if _play_session_token != "":
 		score_body["playSessionToken"] = _play_session_token
 	_make_http_request("/scores", HTTPClient.METHOD_POST, score_body, "submit_score")
@@ -1582,14 +1900,16 @@ func submit_score_to_board(scoreboard_id: String, score: int, streak: int = 0) -
 		emit_signal("score_error", "scoreboard_id is required")
 		return
 
+	# Nickname only sent when the caller actually set one - see submit_score.
 	var body = {
 		"playerId": get_player_id(),
 		"gameId": game_id,
 		"score": score,
 		"streak": streak,
-		"nickname": _nickname if _nickname != "" else _get_default_nickname(),
 		"scoreboardId": scoreboard_id
 	}
+	if _nickname != "":
+		body["nickname"] = _nickname
 	if _play_session_token != "":
 		body["playSessionToken"] = _play_session_token
 
@@ -1642,7 +1962,11 @@ func clear_play_session() -> void:
 # PUBLIC API - LEADERBOARDS
 # ============================================================
 
-func get_leaderboard(sort_by: String = "score", limit: int = 1000) -> void:
+## Fetch the main (all-time) leaderboard. Default limit is 100 entries
+## (v2.2.6; previously 1000) - pass a larger limit explicitly if you
+## genuinely need deeper results. To locate a specific player, use
+## get_player_rank() instead of fetching the whole board.
+func get_leaderboard(sort_by: String = "score", limit: int = 100) -> void:
 	var url = "/leaderboard?sort=%s&limit=%d" % [sort_by, limit]
 	_make_http_request(url, HTTPClient.METHOD_GET, {}, "leaderboard")
 	_log("Leaderboard requested (sort: %s, limit: %d)" % [sort_by, limit])
@@ -1798,35 +2122,150 @@ func unlock_achievements_batch(achievement_ids: Array) -> void:
 		return
 
 	_log("Batch unlocking %d achievements..." % achievement_ids.size())
-	_deferred_achievements_remaining = 1
-	_deferred_achievements_synced = []
-
-	var body = {
-		"playerId": get_player_id(),
-		"achievementIds": achievement_ids
-	}
-	_make_http_request_async("/achievements", HTTPClient.METHOD_POST, body, "unlock_achievement_batch")
+	_send_achievement_batch(achievement_ids)
 
 func get_achievements(player_id: String = "") -> void:
+	# Achievements live on the profile (gameProfile.achievements) - there is
+	# no standalone /players/{id}/achievements route (the old URL returned
+	# "Unknown endpoint"). This fetches the profile and surfaces just the
+	# achievements via achievements_loaded; profile_loaded does NOT fire
+	# for this call.
+	if not _session_token.empty() and player_id == "":
+		_make_http_request("/auth/profile", HTTPClient.METHOD_GET, {}, "achievements")
+		_log("Achievements requested (session profile)")
+		return
 	var pid = player_id if player_id != "" else get_player_id()
-	var url = "/players/%s/achievements" % pid.percent_encode()
+	if pid.empty():
+		_log("No player ID for achievements fetch")
+		emit_signal("achievements_loaded", [])
+		return
+	var url = "/players/%s/profile" % pid.percent_encode()
 	_make_http_request(url, HTTPClient.METHOD_GET, {}, "achievements")
 	_log("Achievements requested for: %s" % pid)
 
 func _flush_deferred_achievements() -> void:
 	if _deferred_achievement_ids.empty():
 		return
-	var count = _deferred_achievement_ids.size()
-	_deferred_achievements_remaining = 1
+	_log("Batch syncing %d achievements..." % _deferred_achievement_ids.size())
+	_send_achievement_batch(_deferred_achievement_ids.duplicate())
+	_deferred_achievement_ids.clear()
+
+## Send a batch achievement unlock on its own HTTPRequest (off the main
+## queue so it never blocks leaderboard loads), with a real completion
+## handler: the generic async path only logs, which left batch unlocks
+## silent - server synced them but achievement_unlocked /
+## achievements_loaded never fired.
+func _send_achievement_batch(achievement_ids: Array) -> void:
+	if api_key.empty() and _session_token.empty():
+		_log("No credentials - skipping achievement batch")
+		return
+	_deferred_achievements_remaining = 0
 	_deferred_achievements_synced = []
-	_log("Batch syncing %d achievements..." % count)
+	_last_batch_ids = achievement_ids.duplicate()
 
 	var body = {
 		"playerId": get_player_id(),
-		"achievementIds": _deferred_achievement_ids.duplicate()
+		"achievementIds": achievement_ids
 	}
-	_make_http_request_async("/achievements", HTTPClient.METHOD_POST, body, "unlock_achievement_batch")
-	_deferred_achievement_ids.clear()
+	var http = HTTPRequest.new()
+	http.pause_mode = Node.PAUSE_MODE_PROCESS
+	add_child(http)
+	var headers = _build_headers("unlock_achievement_batch")
+	_log("HTTP async unlock_achievement_batch: /achievements (%d ids)" % achievement_ids.size())
+	# GD3: no lambdas - bind the node so the handler can free it
+	http.connect("request_completed", self, "_on_achievement_batch_request_completed", [http])
+	var error = http.request(API_BASE_URL + "/achievements", headers, true, HTTPClient.METHOD_POST, to_json(body))
+	if error != OK:
+		_log("Achievement batch failed to start: %s" % error)
+		http.queue_free()
+
+func _on_achievement_batch_request_completed(_result: int, code: int, _headers: PoolStringArray, response_body: PoolByteArray, http: HTTPRequest) -> void:
+	_on_achievement_batch_completed(code, response_body)
+	if is_instance_valid(http):
+		http.queue_free()
+
+# Tolerant batch-response reader. Canonical shape is data.results[] of
+# {success, achievementId}, but this also accepts plain id-string arrays,
+# alternate array keys (unlocked / syncedIds / achievements), alternate id
+# keys (id / achievement), and non-bool success flags. Returns [] when
+# nothing matches - callers fall back to the requested ids on HTTP 200.
+func _parse_batch_synced_ids(data: Dictionary) -> Array:
+	var ids: Array = []
+	for key in ["results", "unlocked", "syncedIds", "achievements"]:
+		var list = data.get(key, [])
+		if typeof(list) != TYPE_ARRAY or list.empty():
+			continue
+		for entry in list:
+			if typeof(entry) == TYPE_STRING:
+				if entry != "":
+					ids.append(entry)
+				continue
+			if typeof(entry) != TYPE_DICTIONARY:
+				continue
+			# Success flag is optional; when present, accept any truthy form.
+			if entry.has("success") and not _truthy(entry["success"]):
+				continue
+			if entry.has("ok") and not _truthy(entry["ok"]):
+				continue
+			var ach_id = str(entry.get("achievementId", entry.get("id", entry.get("achievement", ""))))
+			if ach_id != "":
+				ids.append(ach_id)
+		if not ids.empty():
+			return ids
+	return ids
+
+func _truthy(v) -> bool:
+	match typeof(v):
+		TYPE_BOOL:
+			return v
+		TYPE_INT, TYPE_REAL:
+			return v != 0
+		TYPE_STRING:
+			var t = v.strip_edges().to_lower()
+			return t == "true" or t == "1" or t == "ok" or t == "success"
+		_:
+			return v != null
+
+func _on_achievement_batch_completed(code: int, body: PoolByteArray) -> void:
+	var text = body.get_string_from_utf8()
+	if code < 200 or code >= 300:
+		var msg = "HTTP %d" % code
+		var parsed = JSON.parse(text)
+		if parsed.error == OK and typeof(parsed.result) == TYPE_DICTIONARY:
+			msg = "%s: %s" % [msg, str(parsed.result.get("error", parsed.result.get("message", text)))]
+		elif text != "":
+			msg = "%s: %s" % [msg, text.left(200)]
+		_log("Batch achievement sync failed (%s)" % msg)
+		_last_batch_ids.clear()
+		# Before 2.3.0 a failed batch emitted nothing at all, so games waited
+		# forever. Emit request_failed so the game can react, and
+		# achievements_loaded([]) for parity with the non-batch failure path.
+		emit_signal("request_failed", "unlock_achievement_batch", msg)
+		emit_signal("achievements_loaded", [])
+		return
+	var json = JSON.parse(text)
+	if json.error != OK:
+		_log("Batch achievement sync: invalid JSON response (HTTP %d): %s" % [code, text])
+		_last_batch_ids.clear()
+		return
+	var response = json.result
+	if typeof(response) != TYPE_DICTIONARY:
+		return
+	var data = response.get("data", {})
+	if typeof(data) != TYPE_DICTIONARY:
+		data = {}
+	var synced_ids = _parse_batch_synced_ids(data)
+	if synced_ids.empty() and not _last_batch_ids.empty():
+		# HTTP 2xx means the server persisted the batch even if the body
+		# shape isn't one we recognise - report the requested ids rather
+		# than a false "0 synced".
+		_log("Batch response shape unrecognised; reporting requested ids as synced. Raw: %s" % text)
+		synced_ids = _last_batch_ids.duplicate()
+	for ach_id in synced_ids:
+		emit_signal("achievement_unlocked", ach_id)
+	_log("Batch achievement sync complete: %d synced" % synced_ids.size())
+	emit_signal("achievements_loaded", synced_ids)
+	_last_batch_ids.clear()
 
 # ============================================================
 # BACKWARDS COMPATIBILITY ALIASES (old 3.x SDK method names)
@@ -1899,8 +2338,12 @@ func track_event(event_type: String, metadata: Dictionary = {}) -> void:
 func get_game_info() -> void:
 	_make_http_request("/game", HTTPClient.METHOD_GET, {}, "game_info")
 
+## Game totals (totalPlayers, totalPlays) are part of GET /game; there is
+## no separate stats route. Kept for compatibility - identical to
+## get_game_info(). (Before 2.3.0 this requested /game/stats, which
+## doesn't exist, and failed with request_failed every time.)
 func get_game_stats() -> void:
-	_make_http_request("/game/stats", HTTPClient.METHOD_GET, {}, "game_stats")
+	_make_http_request("/game", HTTPClient.METHOD_GET, {}, "game_stats")
 
 func health_check() -> void:
 	_make_http_request("/health", HTTPClient.METHOD_GET, {}, "health")
