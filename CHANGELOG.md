@@ -2,6 +2,18 @@
 
 Versions track the Godot 4 SDK with a `-3x` suffix. Earlier backport history (v2.1.0-3x through v2.2.3-3x) lived in the template repo before this addon moved to its own repository; the version header comments in `CheddaBoards.gd` carry the full history.
 
+## v2.4.0-3x — 2026-11-10
+
+Brings the backport to parity with the Godot 4 SDK v2.4.0. Adds public API and changes one behaviour (below). Drop-in for existing games unless you relied on that.
+
+### Behaviour change
+- **`login_anonymous()` is ignored while a linked session is active.** It used to flip the SDK to "guest" (`has_account()` false) while every request still carried the linked account's session, so games that call `login_anonymous()` at startup showed a restored linked player as a guest, with no way to log out, while their scores kept going to the account. The call is now logged and skipped, and `login_success` still fires with the linked nickname. To really switch to a guest, call `logout()` first.
+
+### Added
+- **The game ID is read from the API key.** Keys are `cb_<game-id>_<random>`, so `set_api_key()` alone is now enough; assigning `api_key` directly works too. `set_game_id()` is optional and still wins if you call it with a value, and a mismatch with the key is logged. `set_game_id("")` means "no override" and falls back to the key.
+- **`logout(true)` starts a brand-new guest.** Pass `true` to also throw away the saved device ID, so the next `login_anonymous()` is a new anonymous player. Useful on shared devices and for testing link and merge flows. The default is `false`, so plain `logout()` is unchanged.
+- **`reset_device_id()`.** Deletes the saved device ID, resets per-player state and generates a new one. This is what `logout(true)` calls.
+
 ## v2.3.2-3x — 2026-10-27
 
 Brings the backport to parity with the Godot 4 SDK v2.3.2. No breaking changes to signals or public method signatures.
