@@ -2,6 +2,19 @@
 
 Versions track the Godot 4 SDK with a `-3x` suffix. Earlier backport history (v2.1.0-3x through v2.2.3-3x) lived in the template repo before this addon moved to its own repository; the version header comments in `CheddaBoards.gd` carry the full history.
 
+## v2.5.0-3x — 2026-11-25
+
+Brings the backport to parity with the Godot 4 SDK v2.5.0: international display names. Additions only, nothing existing changes. Needs the CheddaBoards API from 25 Nov 2026 (canister v0.18.0, proxy v1.12.0), already live.
+
+### Added
+- **`set_display_name(name)` and `clear_display_name()`**, with `display_name_changed(display_name)` (empty means cleared) and `display_name_error(reason)`. A display name is an optional second name in any language, one per account, not unique, and only works in games with **International names** turned on in the dashboard. A name set before the player's first score is held by the API and applied with that first score. The server normalises the name (2-16 characters, one alphabet, no emoji); show the value from `display_name_changed`.
+- **`get_display_name()`** returns the player's own display name (`""` if none).
+- **`get_entry_name(entry)`** for board rows: the entry's `displayName` when present, otherwise its nickname.
+- **`get_game_info()` now emits `game_info_loaded(info)`** and sets **`international_names`**.
+
+### Fonts
+Godot 3's default font has no Japanese, Chinese or Korean glyphs. Add a CJK font (for example Noto Sans JP) to your `DynamicFont`'s fallbacks before turning International names on. Guide: https://docs.cheddaboards.com/concepts/display-names
+
 ## v2.4.0-3x — 2026-11-10
 
 Brings the backport to parity with the Godot 4 SDK v2.4.0. Adds public API and changes one behaviour (below). Drop-in for existing games unless you relied on that.

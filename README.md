@@ -6,7 +6,7 @@ Online leaderboards, accounts, and achievements for Godot 3.x games. This is the
 
 ## Status
 
-Community-supported backport, built and tested on Godot 3.6. Currently tracks **v2.4.0** of the Godot 4 SDK — identical signals, public methods, and response handling. It works and breaking bugs will be fixed, but new features land in the Godot 4 SDK first and may not be ported. PRs welcome.
+Community-supported backport, built and tested on Godot 3.6. Currently tracks **v2.5.0** of the Godot 4 SDK — identical signals, public methods, and response handling. It works and breaking bugs will be fixed, but new features land in the Godot 4 SDK first and may not be ported. PRs welcome.
 
 ## Quick start
 

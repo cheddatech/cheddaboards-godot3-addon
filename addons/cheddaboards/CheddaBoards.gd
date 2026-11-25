@@ -1,4 +1,4 @@
-# CheddaBoards.gd v2.4.0 (Godot 3.6 Backport)
+# CheddaBoards.gd v2.5.0 (Godot 3.6 Backport)
 # CheddaBoards integration for Godot 3.x
 # https://github.com/cheddatech/CheddaBoards-Godot
 # https://cheddaboards.com
@@ -9,6 +9,19 @@
 #   Player authenticates on their phone at cheddaboards.com/link
 # - Score submissions, play sessions, achievements: all via HTTP API
 #
+# v2.5.0-3x: Matches the Godot 4 SDK v2.5.0 (minor bump: adds public API,
+#             no behaviour changes). International display names: an
+#             optional second name in any language, only in games with
+#             "International names" turned on in the dashboard. Your game
+#             needs a font with those characters (the default font has no
+#             Japanese/Chinese/Korean glyphs).
+#             - set_display_name(name) / clear_display_name(), with
+#               display_name_changed(display_name) and display_name_error(reason).
+#               The server normalises the name: show the signal's value.
+#             - get_display_name(), and get_entry_name(entry) for board rows
+#               (display name if set, otherwise nickname).
+#             - get_game_info() emits game_info_loaded(info) and sets
+#               international_names.
 # v2.4.0-3x: Matches the Godot 4 SDK v2.4.0 (minor bump: adds public API).
 #             - logout(fresh_device_id) : pass true to also throw away the
 #               saved device ID, so the next login_anonymous() is a brand-new
@@ -166,6 +179,8 @@ signal profile_loaded(nickname, score, streak, achievements, play_count)
 signal no_profile()
 signal nickname_changed(new_nickname)
 signal nickname_error(reason)
+signal display_name_changed(display_name)   # v2.5.0-3x, "" = cleared
+signal display_name_error(reason)           # v2.5.0-3x
 
 # --- Scores & Leaderboards (Legacy) ---
 signal score_submitted(score, streak)
@@ -193,6 +208,7 @@ signal achievements_loaded(achievements)
 
 # --- HTTP API ---
 signal request_failed(endpoint, error)
+signal game_info_loaded(info)               # v2.5.0-3x, also sets international_names
 
 # --- Play Sessions (Time Validation) ---
 signal play_session_started(token)
@@ -222,7 +238,7 @@ var debug_logging: bool = false
 
 ## HTTP API Configuration
 ## SDK version. Keep in sync with the header changelog.
-const VERSION = "2.4.0-3x"
+const VERSION = "2.5.0-3x"
 const API_BASE_URL = "https://api.cheddaboards.com"
 ## Direct canister reads (public board GETs served by the canister itself
 ## over the IC HTTP gateway). Same response shape as the proxy; used for
@@ -251,6 +267,9 @@ var api_key: String = "" setget set_api_key
 var game_id: String = ""
 var _game_id_from_key: bool = false   ## game_id came from the key, not set_game_id()
 var _player_id: String = ""
+## v2.5.0-3x: true when this game has "International names" turned on in the
+## dashboard. Filled by get_game_info(); false until then.
+var international_names: bool = false
 var _session_token: String = ""    ## For OAuth session-based auth
 var _play_session_token: String = ""  ## For time validation
 
@@ -263,6 +282,8 @@ var _auth_type: String = ""
 var _cached_profile: Dictionary = {}
 var _nickname_just_changed: bool = false
 var _nickname: String = ""
+var _display_name: String = ""            ## v2.5.0-3x, from the profile / last set
+var _requested_display_name: String = ""  ## sent in the last display name PUT
 
 # Rename correctness state (v2.2.7):
 # _player_exists_on_backend - true once ANY server op confirms the player
@@ -279,7 +300,7 @@ var _player_exists_on_backend: bool = false
 var _player_gen: int = 0
 const PER_PLAYER_TYPES = ["player_profile", "change_nickname", "change_nickname_anonymous",
 	"player_rank", "scoreboard_rank", "start_play_session", "end_play_session",
-	"submit_score", "submit_score_to_board", "unlock_achievement"]
+	"submit_score", "submit_score_to_board", "unlock_achievement", "change_display_name"]
 var _pending_server_nickname: String = ""
 var _pending_rename_attempts: int = 0
 var _requested_nickname: String = ""
@@ -617,6 +638,18 @@ func _emit_http_success(data) -> void:
 				_log("Anonymous nickname changed to: %s" % new_nick)
 			get_player_profile()
 
+		"change_display_name":
+			# null in the response means cleared. Pending (player has no score
+			# yet) still echoes the normalised name, so treat it as set.
+			var dn_raw = data.get("displayName", null) if typeof(data) == TYPE_DICTIONARY else null
+			var dn = "" if dn_raw == null else str(dn_raw)
+			_requested_display_name = ""
+			_display_name = dn
+			if not _cached_profile.empty():
+				_cached_profile["displayName"] = dn
+			_log("Display name %s" % ("cleared" if dn == "" else "set to: " + dn))
+			emit_signal("display_name_changed", dn)
+
 		"unlock_achievement":
 			var ach_id = str(data.get("achievementId", ""))
 			emit_signal("achievement_unlocked", ach_id)
@@ -700,7 +733,13 @@ func _emit_http_success(data) -> void:
 			emit_signal("archive_stats_loaded", total, by_sb)
 			_log("Archive stats: %d total archives" % total)
 
-		"game_info", "game_stats", "health":
+		"game_info", "game_stats":
+			if typeof(data) == TYPE_DICTIONARY:
+				international_names = data.get("internationalNames", false) == true
+				emit_signal("game_info_loaded", data)
+			_log("API response: %s" % str(data))
+
+		"health":
 			_log("API response: %s" % str(data))
 
 		"start_play_session":
@@ -788,6 +827,9 @@ func _emit_http_failure(error: String) -> void:
 		"change_nickname", "change_nickname_anonymous":
 			_requested_nickname = ""
 			emit_signal("nickname_error", error)
+		"change_display_name":
+			_requested_display_name = ""
+			emit_signal("display_name_error", error)
 		"unlock_achievement":
 			if _deferred_achievements_remaining > 0:
 				_deferred_achievements_remaining -= 1
@@ -1047,6 +1089,9 @@ func _update_cached_profile(profile: Dictionary) -> void:
 		play_count = _safe_int(profile.get("playCount", profile.get("plays", 0)))
 
 	_nickname = nickname
+	# v2.5.0-3x: only present when the game has International names on.
+	var dn_raw = profile.get("displayName", null)
+	_display_name = "" if dn_raw == null else str(dn_raw)
 	emit_signal("profile_loaded", nickname, score, streak, achievements, play_count)
 
 # ============================================================
@@ -1225,6 +1270,8 @@ func _reset_player_state() -> void:
 	_pending_server_nickname = ""
 	_pending_rename_attempts = 0
 	_requested_nickname = ""
+	_display_name = ""
+	_requested_display_name = ""
 	_play_session_token = ""
 	_last_profile_refresh = 0.0
 
@@ -1385,6 +1432,7 @@ func _expire_session() -> void:
 	_session_token = ""
 	_auth_type = ""
 	_nickname = ""
+	_display_name = ""
 	_cached_profile = {}
 	_clear_saved_session()
 	emit_signal("session_expired")
@@ -1558,6 +1606,61 @@ func change_nickname(new_nickname: String = "") -> void:
 		_log("Nickname change requested (API) for: %s -> %s" % [pid, new_nickname])
 	else:
 		emit_signal("nickname_error", "Not authenticated")
+
+# ============================================================
+# PUBLIC API - DISPLAY NAMES (v2.5.0-3x)
+# ============================================================
+# A display name is an optional second name in any language. It only works
+# in games with "International names" turned on in the dashboard. Your UI
+# needs a font with the characters players will type: add a CJK font (for
+# example Noto Sans JP) as a fallback on your DynamicFont.
+#
+#   CheddaBoards.connect("display_name_changed", self, "_on_dn_changed")
+#   CheddaBoards.connect("display_name_error", self, "_on_dn_error")
+#   CheddaBoards.set_display_name("Ana María")
+
+## Set the player's display name. "" clears it (same as clear_display_name()).
+## The server enforces the rules (2-16 characters, one alphabet with
+## Japanese/Chinese/Korean mixes allowed, no emoji) and normalises the text,
+## so use the value from display_name_changed.
+func set_display_name(display_name: String) -> void:
+	var dn = display_name.strip_edges()
+	if dn.length() > 48:
+		emit_signal("display_name_error", "Display name is too long")
+		return
+	var body = {"displayName": null if dn.empty() else dn}
+	if not _session_token.empty():
+		_requested_display_name = dn
+		_make_http_request("/profile/display-name", HTTPClient.METHOD_PUT, body, "change_display_name")
+		_log("Display name change requested (session)")
+	elif not api_key.empty():
+		var pid = get_player_id()
+		if pid.empty():
+			emit_signal("display_name_error", "No player ID set")
+			return
+		_requested_display_name = dn
+		var url = "/players/%s/display-name" % pid.percent_encode()
+		_make_http_request(url, HTTPClient.METHOD_PUT, body, "change_display_name")
+		_log("Display name change requested (API) for: %s" % pid)
+	else:
+		emit_signal("display_name_error", "Not authenticated")
+
+## Remove the player's display name; they show as their nickname again.
+func clear_display_name() -> void:
+	set_display_name("")
+
+## The player's own display name, "" if none (or the game has International
+## names off).
+func get_display_name() -> String:
+	return _display_name
+
+## The name to show for a board entry: the display name when the entry has
+## one, otherwise the nickname. "" means an unnamed guest.
+func get_entry_name(entry: Dictionary) -> String:
+	var dn = entry.get("displayName", null)
+	if dn != null and str(dn) != "":
+		return str(dn)
+	return str(entry.get("nickname", ""))
 
 # ============================================================
 # PUBLIC API - DEVICE CODE AUTH (Cross-platform social login)
@@ -2449,6 +2552,8 @@ func debug_status() -> void:
 	print("  Anonymous:        %s" % str(is_anonymous()))
 	print("----------------------------------------------")
 	print("  Nickname:         %s" % get_nickname())
+	print("  Display Name:     %s" % get_display_name())
+	print("  Intl Names:       %s" % str(international_names))
 	print("  High Score:       %s" % str(get_high_score()))
 	print("  Best Streak:      %s" % str(get_best_streak()))
 	print("  Play Count:       %s" % str(get_play_count()))
